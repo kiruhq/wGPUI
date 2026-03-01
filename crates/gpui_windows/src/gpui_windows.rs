@@ -16,6 +16,7 @@ mod util;
 mod vsync;
 mod window;
 mod wrapper;
+mod wgpu_renderer;
 
 pub(crate) use clipboard::*;
 pub(crate) use destination_list::*;
@@ -33,6 +34,7 @@ pub(crate) use util::*;
 pub(crate) use vsync::*;
 pub(crate) use window::*;
 pub(crate) use wrapper::*;
+pub(crate) use wgpu_renderer::*;
 
 pub use platform::WindowsPlatform;
 

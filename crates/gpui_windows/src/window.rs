@@ -57,7 +57,7 @@ pub struct WindowsWindowState {
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
 
-    pub renderer: RefCell<DirectXRenderer>,
+    pub renderer: RefCell<WgpuWindowRenderer>,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -117,8 +117,8 @@ impl WindowsWindowState {
         };
         let border_offset = WindowBorderOffset::default();
         let restore_from_minimized = None;
-        let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
-            .context("Creating DirectX renderer")?;
+        let renderer = WgpuWindowRenderer::new(hwnd, directx_devices, disable_direct_composition)
+            .context("Creating wgpu renderer")?;
         let callbacks = Callbacks::default();
         let input_handler = None;
         let pending_surrogate = None;
@@ -533,7 +533,9 @@ impl rwh::HasWindowHandle for WindowsWindow {
 // todo(windows)
 impl rwh::HasDisplayHandle for WindowsWindow {
     fn display_handle(&self) -> std::result::Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
-        unimplemented!()
+        let raw = rwh::RawDisplayHandle::Windows(rwh::WindowsDisplayHandle::new());
+        // SAFETY: Windows display handles do not borrow external data.
+        Ok(unsafe { rwh::DisplayHandle::borrow_raw(raw) })
     }
 }
 
@@ -792,7 +794,7 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
-        true
+        self.state.renderer.borrow().supports_subpixel_rendering()
     }
 
     fn set_title(&mut self, title: &str) {
@@ -803,6 +805,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         self.state.background_appearance.set(background_appearance);
+        self.state
+            .renderer
+            .borrow_mut()
+            .update_transparency(!matches!(background_appearance, WindowBackgroundAppearance::Opaque));
         let hwnd = self.0.hwnd;
 
         // using Dwm APIs for Mica and MicaAlt backdrops.
