@@ -25,6 +25,7 @@ members = [
     "crates/zlog",
     "crates/ztracing",
     "crates/ztracing_macro",
+    "examples/gpui-example",
     "tooling/perf",
 ]
 default-members = ["crates/gpui"]

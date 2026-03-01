@@ -8,8 +8,11 @@ use gpui::{
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -71,6 +74,211 @@ pub struct WgpuSurfaceConfig {
     pub transparent: bool,
 }
 
+const DEFAULT_CUSTOM_SHADER_WGSL: &str = r#"
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0)
+    );
+    let xy = positions[vertex_index];
+    return vec4<f32>(xy, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+}
+"#;
+
+pub struct CustomShaderDescriptor<'a> {
+    pub label: Option<&'a str>,
+    pub shader_source: &'a str,
+    pub vertex_entry: &'a str,
+    pub fragment_entry: &'a str,
+    pub primitive_topology: wgpu::PrimitiveTopology,
+    pub vertex_count: u32,
+    pub instance_count: u32,
+    pub uniform_bytes: Option<&'a [u8]>,
+    pub blend_state: Option<wgpu::BlendState>,
+}
+
+#[derive(Clone)]
+pub struct GlobalCustomShaderConfig {
+    pub label: Option<String>,
+    pub shader_source: String,
+    pub vertex_entry: String,
+    pub fragment_entry: String,
+    pub primitive_topology: wgpu::PrimitiveTopology,
+    pub vertex_count: u32,
+    pub instance_count: u32,
+    pub uniform_bytes: Option<Vec<u8>>,
+    pub blend_state: Option<wgpu::BlendState>,
+    pub animate_uniforms_with_time: bool,
+}
+
+impl Default for GlobalCustomShaderConfig {
+    fn default() -> Self {
+        Self {
+            label: Some("gpui_custom_shader".to_string()),
+            shader_source: DEFAULT_CUSTOM_SHADER_WGSL.to_string(),
+            vertex_entry: "vs_main".to_string(),
+            fragment_entry: "fs_main".to_string(),
+            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
+            vertex_count: 3,
+            instance_count: 1,
+            uniform_bytes: None,
+            blend_state: None,
+            animate_uniforms_with_time: false,
+        }
+    }
+}
+
+static GLOBAL_CUSTOM_SHADER_CONFIG: OnceLock<Mutex<Option<GlobalCustomShaderConfig>>> =
+    OnceLock::new();
+static GLOBAL_CUSTOM_SHADER_RUNTIME: OnceLock<Mutex<GlobalCustomShaderRuntime>> = OnceLock::new();
+static NAMED_CUSTOM_SHADER_CONFIGS: OnceLock<Mutex<HashMap<String, GlobalCustomShaderConfig>>> =
+    OnceLock::new();
+static SHADER_SURFACE_DRAWS: OnceLock<Mutex<Vec<ShaderSurfaceDraw>>> = OnceLock::new();
+
+fn global_custom_shader_config() -> &'static Mutex<Option<GlobalCustomShaderConfig>> {
+    GLOBAL_CUSTOM_SHADER_CONFIG.get_or_init(|| Mutex::new(None))
+}
+
+#[derive(Clone)]
+struct GlobalCustomShaderRuntime {
+    enabled: bool,
+    paused: bool,
+    time_scale: f32,
+    uniform_bytes: Option<Vec<u8>>,
+}
+
+impl Default for GlobalCustomShaderRuntime {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            paused: false,
+            time_scale: 1.0,
+            uniform_bytes: None,
+        }
+    }
+}
+
+fn global_custom_shader_runtime() -> &'static Mutex<GlobalCustomShaderRuntime> {
+    GLOBAL_CUSTOM_SHADER_RUNTIME.get_or_init(|| Mutex::new(GlobalCustomShaderRuntime::default()))
+}
+
+fn named_custom_shader_configs() -> &'static Mutex<HashMap<String, GlobalCustomShaderConfig>> {
+    NAMED_CUSTOM_SHADER_CONFIGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn shader_surface_draws() -> &'static Mutex<Vec<ShaderSurfaceDraw>> {
+    SHADER_SURFACE_DRAWS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn take_shader_surface_draws() -> Vec<ShaderSurfaceDraw> {
+    shader_surface_draws()
+        .lock()
+        .map(|mut draws| std::mem::take(&mut *draws))
+        .unwrap_or_default()
+}
+
+pub fn set_global_custom_shader(config: Option<GlobalCustomShaderConfig>) {
+    if let Ok(mut slot) = global_custom_shader_config().lock() {
+        *slot = config;
+    }
+}
+
+pub fn set_global_custom_shader_enabled(enabled: bool) {
+    if let Ok(mut runtime) = global_custom_shader_runtime().lock() {
+        runtime.enabled = enabled;
+    }
+}
+
+pub fn set_global_custom_shader_paused(paused: bool) {
+    if let Ok(mut runtime) = global_custom_shader_runtime().lock() {
+        runtime.paused = paused;
+    }
+}
+
+pub fn set_global_custom_shader_time_scale(time_scale: f32) {
+    if let Ok(mut runtime) = global_custom_shader_runtime().lock() {
+        runtime.time_scale = time_scale.max(0.0);
+    }
+}
+
+pub fn set_global_custom_shader_uniform_bytes(uniform_bytes: Option<Vec<u8>>) {
+    if let Ok(mut runtime) = global_custom_shader_runtime().lock() {
+        runtime.uniform_bytes = uniform_bytes;
+    }
+}
+
+pub fn register_named_custom_shader(
+    shader_key: impl Into<String>,
+    config: GlobalCustomShaderConfig,
+) {
+    if let Ok(mut configs) = named_custom_shader_configs().lock() {
+        configs.insert(shader_key.into(), config);
+    }
+}
+
+pub fn unregister_named_custom_shader(shader_key: &str) {
+    if let Ok(mut configs) = named_custom_shader_configs().lock() {
+        configs.remove(shader_key);
+    }
+}
+
+pub fn clear_shader_surface_draws() {
+    if let Ok(mut draws) = shader_surface_draws().lock() {
+        draws.clear();
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ShaderSurfaceDraw {
+    pub shader_key: String,
+    pub normalized_bounds: [f32; 4],
+    pub uniform_bytes: Option<Vec<u8>>,
+}
+
+pub fn push_shader_surface_draw(draw: ShaderSurfaceDraw) {
+    if let Ok(mut draws) = shader_surface_draws().lock() {
+        draws.push(draw);
+    }
+}
+
+impl<'a> Default for CustomShaderDescriptor<'a> {
+    fn default() -> Self {
+        Self {
+            label: Some("gpui_custom_shader"),
+            shader_source: DEFAULT_CUSTOM_SHADER_WGSL,
+            vertex_entry: "vs_main",
+            fragment_entry: "fs_main",
+            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
+            vertex_count: 3,
+            instance_count: 1,
+            uniform_bytes: None,
+            blend_state: None,
+        }
+    }
+}
+
+pub struct WgpuCustomShader {
+    pipeline: wgpu::RenderPipeline,
+    uniform_buffer: Option<wgpu::Buffer>,
+    uniform_bind_group: Option<wgpu::BindGroup>,
+    uniform_size: Option<NonZeroU64>,
+    vertex_count: u32,
+    instance_count: u32,
+}
+
+struct NamedCustomShader {
+    shader: WgpuCustomShader,
+    uniform_template: Option<Vec<u8>>,
+    animate_uniforms_with_time: bool,
+}
+
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
@@ -119,6 +327,13 @@ pub struct WgpuRenderer {
     transparent_alpha_mode: wgpu::CompositeAlphaMode,
     opaque_alpha_mode: wgpu::CompositeAlphaMode,
     max_texture_size: u32,
+    global_custom_shader: Option<WgpuCustomShader>,
+    global_custom_shader_init_failed: bool,
+    global_custom_shader_uniform_template: Option<Vec<u8>>,
+    global_custom_shader_animate_uniforms: bool,
+    global_custom_shader_last_tick: Instant,
+    global_custom_shader_time_seconds: f32,
+    named_custom_shaders: HashMap<String, NamedCustomShader>,
 }
 
 impl WgpuRenderer {
@@ -391,6 +606,13 @@ impl WgpuRenderer {
             transparent_alpha_mode,
             opaque_alpha_mode,
             max_texture_size,
+            global_custom_shader: None,
+            global_custom_shader_init_failed: false,
+            global_custom_shader_uniform_template: None,
+            global_custom_shader_animate_uniforms: false,
+            global_custom_shader_last_tick: Instant::now(),
+            global_custom_shader_time_seconds: 0.0,
+            named_custom_shaders: HashMap::new(),
         })
     }
 
@@ -529,7 +751,7 @@ impl WgpuRenderer {
         let base_shader_source = include_str!("shaders.wgsl");
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gpui_shaders"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(base_shader_source)),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(base_shader_source)),
         });
 
         let subpixel_shader_source = include_str!("shaders_subpixel.wgsl");
@@ -539,7 +761,7 @@ impl WgpuRenderer {
             );
             Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("gpui_subpixel_shaders"),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(combined)),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(combined)),
             }))
         } else {
             None
@@ -950,6 +1172,285 @@ impl WgpuRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        self.ensure_global_custom_shader();
+        let shader_surface_draws = take_shader_surface_draws();
+        self.ensure_named_custom_shaders(&shader_surface_draws);
+        let runtime = global_custom_shader_runtime()
+            .lock()
+            .map(|runtime| runtime.clone())
+            .unwrap_or_default();
+        let custom_shader_time_seconds = self.advance_custom_shader_time(&runtime);
+
+        if let Some(shader) = self.global_custom_shader.take() {
+            if runtime.enabled {
+                if let Err(error) = self.update_global_custom_shader_uniforms(
+                    &shader,
+                    runtime.clone(),
+                    custom_shader_time_seconds,
+                ) {
+                    log::error!("Failed to update global custom shader uniforms: {error:#}");
+                }
+                self.draw_internal(
+                    scene,
+                    Some(&shader),
+                    &shader_surface_draws,
+                    custom_shader_time_seconds,
+                );
+            } else {
+                self.draw_internal(scene, None, &shader_surface_draws, custom_shader_time_seconds);
+            }
+            self.global_custom_shader = Some(shader);
+        } else {
+            self.draw_internal(scene, None, &shader_surface_draws, custom_shader_time_seconds);
+        }
+    }
+
+    pub fn draw_with_custom_shader(&mut self, scene: &Scene, shader: &WgpuCustomShader) {
+        let runtime = global_custom_shader_runtime()
+            .lock()
+            .map(|runtime| runtime.clone())
+            .unwrap_or_default();
+        let custom_shader_time_seconds = self.advance_custom_shader_time(&runtime);
+        self.draw_internal(scene, Some(shader), &[], custom_shader_time_seconds);
+    }
+
+    pub fn create_custom_shader(
+        &self,
+        descriptor: CustomShaderDescriptor<'_>,
+    ) -> anyhow::Result<WgpuCustomShader> {
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: descriptor.label,
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(descriptor.shader_source)),
+            });
+
+        let uniform_size = descriptor
+            .uniform_bytes
+            .map(|bytes| {
+                NonZeroU64::new(bytes.len() as u64)
+                    .ok_or_else(|| anyhow::anyhow!("uniform_bytes cannot be empty"))
+            })
+            .transpose()?;
+
+        let (uniform_buffer, uniform_bind_group, uniform_layout) =
+            if let Some(bytes) = descriptor.uniform_bytes {
+                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: descriptor.label,
+                    size: bytes.len() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.queue.write_buffer(&buffer, 0, bytes);
+
+                let layout =
+                    self.device
+                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                            label: descriptor.label,
+                            entries: &[wgpu::BindGroupLayoutEntry {
+                                binding: 0,
+                                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Uniform,
+                                    has_dynamic_offset: false,
+                                    min_binding_size: uniform_size,
+                                },
+                                count: None,
+                            }],
+                        });
+
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: descriptor.label,
+                    layout: &layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &buffer,
+                            offset: 0,
+                            size: uniform_size,
+                        }),
+                    }],
+                });
+
+                (Some(buffer), Some(bind_group), Some(layout))
+            } else {
+                (None, None, None)
+            };
+
+        let default_blend = match self.surface_config.alpha_mode {
+            wgpu::CompositeAlphaMode::PreMultiplied => {
+                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
+            }
+            _ => wgpu::BlendState::ALPHA_BLENDING,
+        };
+
+        let target = wgpu::ColorTargetState {
+            format: self.surface_config.format,
+            blend: Some(descriptor.blend_state.unwrap_or(default_blend)),
+            write_mask: wgpu::ColorWrites::ALL,
+        };
+
+        let layout_refs: [&wgpu::BindGroupLayout; 1];
+        let bind_group_layouts = if let Some(layout) = uniform_layout.as_ref() {
+            layout_refs = [layout];
+            &layout_refs[..]
+        } else {
+            &[]
+        };
+
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: descriptor.label,
+                bind_group_layouts,
+                immediate_size: 0,
+            });
+
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: descriptor.label,
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some(descriptor.vertex_entry),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(descriptor.fragment_entry),
+                    targets: &[Some(target)],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: descriptor.primitive_topology,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            });
+
+        Ok(WgpuCustomShader {
+            pipeline,
+            uniform_buffer,
+            uniform_bind_group,
+            uniform_size,
+            vertex_count: descriptor.vertex_count,
+            instance_count: descriptor.instance_count,
+        })
+    }
+
+    pub fn update_custom_shader_uniforms(
+        &self,
+        shader: &WgpuCustomShader,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let Some(buffer) = shader.uniform_buffer.as_ref() else {
+            anyhow::bail!("shader does not define uniforms");
+        };
+        let Some(size) = shader.uniform_size else {
+            anyhow::bail!("shader does not define uniform size");
+        };
+        anyhow::ensure!(
+            bytes.len() == size.get() as usize,
+            "uniform size mismatch: expected {}, got {}",
+            size.get(),
+            bytes.len()
+        );
+        self.queue.write_buffer(buffer, 0, bytes);
+        Ok(())
+    }
+
+    fn ensure_global_custom_shader(&mut self) {
+        if self.global_custom_shader.is_some() || self.global_custom_shader_init_failed {
+            return;
+        }
+
+        let config = global_custom_shader_config()
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        let Some(config) = config else {
+            return;
+        };
+
+        let descriptor = CustomShaderDescriptor {
+            label: config.label.as_deref(),
+            shader_source: &config.shader_source,
+            vertex_entry: &config.vertex_entry,
+            fragment_entry: &config.fragment_entry,
+            primitive_topology: config.primitive_topology,
+            vertex_count: config.vertex_count,
+            instance_count: config.instance_count,
+            uniform_bytes: config.uniform_bytes.as_deref(),
+            blend_state: config.blend_state,
+        };
+
+        match self.create_custom_shader(descriptor) {
+            Ok(shader) => {
+                self.global_custom_shader = Some(shader);
+                self.global_custom_shader_uniform_template = config.uniform_bytes.clone();
+                self.global_custom_shader_animate_uniforms = config.animate_uniforms_with_time;
+                self.global_custom_shader_last_tick = Instant::now();
+                self.global_custom_shader_time_seconds = 0.0;
+            }
+            Err(error) => {
+                self.global_custom_shader_init_failed = true;
+                log::error!("Failed to initialize global custom shader: {error:#}");
+            }
+        }
+    }
+
+    fn update_global_custom_shader_uniforms(
+        &mut self,
+        shader: &WgpuCustomShader,
+        runtime: GlobalCustomShaderRuntime,
+        custom_shader_time_seconds: f32,
+    ) -> anyhow::Result<()> {
+        if !self.global_custom_shader_animate_uniforms {
+            return Ok(());
+        }
+
+        let Some(uniform_size) = shader.uniform_size else {
+            return Ok(());
+        };
+
+        let mut bytes = self
+            .global_custom_shader_uniform_template
+            .clone()
+            .unwrap_or_default();
+        bytes.resize(uniform_size.get() as usize, 0);
+
+        self.apply_standard_time_uniforms(&mut bytes, custom_shader_time_seconds);
+
+        if let Some(runtime_bytes) = runtime.uniform_bytes.as_ref() {
+            let len = bytes.len().min(runtime_bytes.len());
+            bytes[..len].copy_from_slice(&runtime_bytes[..len]);
+            self.apply_standard_time_uniforms(&mut bytes, custom_shader_time_seconds);
+        }
+
+        self.update_custom_shader_uniforms(shader, &bytes)
+    }
+
+    fn draw_internal(
+        &mut self,
+        scene: &Scene,
+        custom_shader: Option<&WgpuCustomShader>,
+        shader_surface_draws: &[ShaderSurfaceDraw],
+        custom_shader_time_seconds: f32,
+    ) {
         self.atlas.before_frame();
 
         let frame = match self.surface.get_current_texture() {
@@ -1125,6 +1626,69 @@ impl WgpuRenderer {
                 }
             }
 
+            if let Some(shader) = custom_shader {
+                if shader.vertex_count > 0 && shader.instance_count > 0 {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("custom_shader_pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &frame_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    self.draw_custom_shader_pass(shader, &mut pass);
+                }
+            }
+
+            for draw in shader_surface_draws {
+                let Some(named_shader) = self.named_custom_shaders.get(&draw.shader_key) else {
+                    continue;
+                };
+                if let Err(error) = self.update_named_custom_shader_uniforms(
+                    named_shader,
+                    draw.uniform_bytes.as_deref(),
+                    custom_shader_time_seconds,
+                ) {
+                    log::error!(
+                        "Failed to update shader surface uniforms for '{}': {error:#}",
+                        draw.shader_key
+                    );
+                    continue;
+                }
+
+                let Some((x, y, width, height)) = self.normalized_bounds_to_scissor(draw) else {
+                    continue;
+                };
+
+                if named_shader.shader.vertex_count == 0 || named_shader.shader.instance_count == 0
+                {
+                    continue;
+                }
+
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("shader_surface_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &frame_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_scissor_rect(x, y, width, height);
+                self.draw_custom_shader_pass(&named_shader.shader, &mut pass);
+            }
+
             if overflow {
                 drop(encoder);
                 if self.instance_buffer_capacity >= self.max_buffer_size {
@@ -1143,6 +1707,148 @@ impl WgpuRenderer {
             frame.present();
             return;
         }
+    }
+
+    fn draw_custom_shader_pass(&self, shader: &WgpuCustomShader, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_pipeline(&shader.pipeline);
+        if let Some(bind_group) = shader.uniform_bind_group.as_ref() {
+            pass.set_bind_group(0, bind_group, &[]);
+        }
+        pass.draw(0..shader.vertex_count, 0..shader.instance_count);
+    }
+
+    fn ensure_named_custom_shaders(&mut self, draws: &[ShaderSurfaceDraw]) {
+        let configured_shaders = named_custom_shader_configs()
+            .lock()
+            .map(|configs| configs.clone())
+            .unwrap_or_default();
+
+        for draw in draws {
+            if self.named_custom_shaders.contains_key(&draw.shader_key) {
+                continue;
+            }
+            let Some(config) = configured_shaders.get(&draw.shader_key).cloned() else {
+                log::warn!(
+                    "Shader surface referenced unknown shader key '{}'",
+                    draw.shader_key
+                );
+                continue;
+            };
+
+            let descriptor = CustomShaderDescriptor {
+                label: config.label.as_deref(),
+                shader_source: &config.shader_source,
+                vertex_entry: &config.vertex_entry,
+                fragment_entry: &config.fragment_entry,
+                primitive_topology: config.primitive_topology,
+                vertex_count: config.vertex_count,
+                instance_count: config.instance_count,
+                uniform_bytes: config.uniform_bytes.as_deref(),
+                blend_state: config.blend_state,
+            };
+
+            match self.create_custom_shader(descriptor) {
+                Ok(shader) => {
+                    self.named_custom_shaders.insert(
+                        draw.shader_key.clone(),
+                        NamedCustomShader {
+                            shader,
+                            uniform_template: config.uniform_bytes,
+                            animate_uniforms_with_time: config.animate_uniforms_with_time,
+                        },
+                    );
+                }
+                Err(error) => {
+                    log::error!(
+                        "Failed to initialize named custom shader '{}': {error:#}",
+                        draw.shader_key
+                    );
+                }
+            }
+        }
+    }
+
+    fn advance_custom_shader_time(&mut self, runtime: &GlobalCustomShaderRuntime) -> f32 {
+        let now = Instant::now();
+        if !runtime.paused {
+            let dt = now
+                .saturating_duration_since(self.global_custom_shader_last_tick)
+                .as_secs_f32();
+            self.global_custom_shader_time_seconds += dt * runtime.time_scale;
+        }
+        self.global_custom_shader_last_tick = now;
+        self.global_custom_shader_time_seconds
+    }
+
+    fn apply_standard_time_uniforms(&self, bytes: &mut [u8], custom_shader_time_seconds: f32) {
+        if bytes.len() < 16 {
+            return;
+        }
+        let params = [
+            custom_shader_time_seconds,
+            self.surface_config.width as f32,
+            self.surface_config.height as f32,
+            0.0f32,
+        ];
+        bytes[..16].copy_from_slice(bytemuck::bytes_of(&params));
+    }
+
+    fn update_named_custom_shader_uniforms(
+        &self,
+        named_shader: &NamedCustomShader,
+        draw_uniform_bytes: Option<&[u8]>,
+        custom_shader_time_seconds: f32,
+    ) -> anyhow::Result<()> {
+        let Some(uniform_size) = named_shader.shader.uniform_size else {
+            return Ok(());
+        };
+
+        let mut bytes = if let Some(draw_uniform_bytes) = draw_uniform_bytes {
+            let mut bytes = draw_uniform_bytes.to_vec();
+            bytes.resize(uniform_size.get() as usize, 0);
+            bytes
+        } else {
+            let mut bytes = named_shader.uniform_template.clone().unwrap_or_default();
+            bytes.resize(uniform_size.get() as usize, 0);
+            bytes
+        };
+
+        if named_shader.animate_uniforms_with_time {
+            self.apply_standard_time_uniforms(&mut bytes, custom_shader_time_seconds);
+        }
+
+        self.update_custom_shader_uniforms(&named_shader.shader, &bytes)
+    }
+
+    fn normalized_bounds_to_scissor(
+        &self,
+        draw: &ShaderSurfaceDraw,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let [min_x, min_y, max_x, max_y] = draw.normalized_bounds;
+        let min_x = min_x.clamp(0.0, 1.0);
+        let min_y = min_y.clamp(0.0, 1.0);
+        let max_x = max_x.clamp(0.0, 1.0);
+        let max_y = max_y.clamp(0.0, 1.0);
+
+        if max_x <= min_x || max_y <= min_y {
+            return None;
+        }
+
+        let surface_width = self.surface_config.width as f32;
+        let surface_height = self.surface_config.height as f32;
+
+        let x = (min_x * surface_width).floor().max(0.0) as u32;
+        let y = (min_y * surface_height).floor().max(0.0) as u32;
+        let max_x_px = (max_x * surface_width).ceil().max(0.0) as u32;
+        let max_y_px = (max_y * surface_height).ceil().max(0.0) as u32;
+
+        let width = max_x_px.saturating_sub(x);
+        let height = max_y_px.saturating_sub(y);
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        Some((x, y, width, height))
     }
 
     fn draw_quads(
