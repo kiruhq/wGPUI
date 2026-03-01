@@ -39,7 +39,7 @@ use std::{
     mem,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::ImageCacheProvider;
@@ -47,6 +47,8 @@ use super::ImageCacheProvider;
 const DRAG_THRESHOLD: f64 = 2.;
 const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
+const SCROLLBAR_AUTO_HIDE_DELAY: Duration = Duration::from_millis(2000);
+const SCROLLBAR_FADE_OUT_DURATION: Duration = Duration::from_millis(350);
 
 /// The styling information for a given group.
 pub struct GroupStyle {
@@ -2005,6 +2007,14 @@ impl Interactivity {
 
                                         self.paint_keyboard_listeners(window, cx);
                                         f(&style, window, cx);
+                                        self.paint_scrollbars(
+                                            bounds,
+                                            &style,
+                                            hitbox,
+                                            element_state.as_mut(),
+                                            window,
+                                            cx,
+                                        );
 
                                         if let Some(_hitbox) = hitbox {
                                             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2655,6 +2665,440 @@ impl Interactivity {
         }
     }
 
+    fn paint_scrollbars(
+        &self,
+        bounds: Bounds<Pixels>,
+        style: &Style,
+        hitbox: Option<&Hitbox>,
+        element_state: Option<&mut InteractiveElementState>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let scrollbar_width = style.scrollbar_width.to_pixels(window.rem_size());
+        if scrollbar_width <= px(0.) {
+            return;
+        }
+
+        let Some(scroll_offset) = self.scroll_offset.as_ref() else {
+            return;
+        };
+
+        let offset = *scroll_offset.borrow();
+        let padding = style
+            .padding
+            .to_pixels(bounds.size.into(), window.rem_size());
+        let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
+        let content_size = self.content_size + padding_size;
+        let max_offset = (content_size - bounds.size).max(&Default::default());
+
+        let (scrollbar_drag_state, scrollbar_visible_until, scrollbar_visibility_seq) =
+            if let Some(state) = element_state {
+                (
+                    Some(
+                        state
+                            .scrollbar_drag_state
+                            .get_or_insert_with(Default::default)
+                            .clone(),
+                    ),
+                    Some(
+                        state
+                            .scrollbar_visible_until
+                            .get_or_insert_with(Default::default)
+                            .clone(),
+                    ),
+                    Some(
+                        state
+                            .scrollbar_visibility_seq
+                            .get_or_insert_with(Default::default)
+                            .clone(),
+                    ),
+                )
+            } else {
+                (None, None, None)
+            };
+
+        if style.overflow.y == Overflow::Scroll
+            && max_offset.height > px(0.)
+            && bounds.size.height > px(0.)
+        {
+            let viewport_h = bounds.size.height;
+            let content_h = viewport_h + max_offset.height;
+            let thumb_h = ((viewport_h / content_h) * viewport_h)
+                .max(px(24.))
+                .min(viewport_h);
+            let travel = (viewport_h - thumb_h).max(px(0.));
+            let scrolled = (-offset.y).clamp(px(0.), max_offset.height);
+            let thumb_top = if max_offset.height <= px(0.) {
+                px(0.)
+            } else {
+                (scrolled / max_offset.height) * travel
+            };
+
+            let track_bounds = Bounds::new(
+                point(bounds.right() - scrollbar_width, bounds.top()),
+                size(scrollbar_width, viewport_h),
+            );
+            let thumb_bounds = Bounds::new(
+                point(track_bounds.left(), track_bounds.top() + thumb_top),
+                size(scrollbar_width, thumb_h),
+            );
+
+            if let (Some(hitbox), Some(scrollbar_drag_state)) = (hitbox, scrollbar_drag_state.as_ref())
+            {
+                let hitbox_for_mouse_down = hitbox.clone();
+                let scrollbar_drag_state = scrollbar_drag_state.clone();
+                let scroll_offset = scroll_offset.clone();
+                let current_view = window.current_view();
+                let track_bounds_for_mouse_down = track_bounds;
+                let thumb_bounds_for_mouse_down = thumb_bounds;
+                let travel_for_mouse_down = travel;
+                let max_offset_height_for_mouse_down = max_offset.height;
+                let thumb_h_for_mouse_down = thumb_h;
+                let scrollbar_visible_until_for_mouse_down = scrollbar_visible_until.clone();
+                let scrollbar_visibility_seq_for_mouse_down = scrollbar_visibility_seq.clone();
+
+                let scrollbar_drag_state_for_mouse_down = scrollbar_drag_state.clone();
+                let scroll_offset_for_mouse_down = scroll_offset.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble || !hitbox_for_mouse_down.is_hovered(window) {
+                        return;
+                    }
+
+                    if !track_bounds_for_mouse_down.contains(&event.position) {
+                        return;
+                    }
+
+                    if let (Some(visible_until), Some(visibility_seq)) = (
+                        scrollbar_visible_until_for_mouse_down.as_ref(),
+                        scrollbar_visibility_seq_for_mouse_down.as_ref(),
+                    ) {
+                        *visible_until.borrow_mut() = Some(Instant::now() + SCROLLBAR_AUTO_HIDE_DELAY);
+                        let ticket = {
+                            let mut seq = visibility_seq.borrow_mut();
+                            *seq += 1;
+                            *seq
+                        };
+                        let visibility_seq = visibility_seq.clone();
+                        let current_view = current_view;
+                        window
+                            .spawn(cx, async move |cx| {
+                                cx.background_executor()
+                                    .timer(
+                                        SCROLLBAR_AUTO_HIDE_DELAY
+                                            .saturating_sub(SCROLLBAR_FADE_OUT_DURATION),
+                                    )
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                                cx.background_executor()
+                                    .timer(SCROLLBAR_FADE_OUT_DURATION)
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                            })
+                            .detach();
+                    }
+
+                    let mut drag_state = scrollbar_drag_state_for_mouse_down.borrow_mut();
+                    let mut offset = scroll_offset_for_mouse_down.borrow_mut();
+
+                    if thumb_bounds_for_mouse_down.contains(&event.position) {
+                        *drag_state = Some(ScrollbarDragState {
+                            grab_offset_y: event.position.y - thumb_bounds_for_mouse_down.top(),
+                        });
+                        cx.notify(current_view);
+                    } else {
+                        let thumb_top = (event.position.y
+                            - track_bounds_for_mouse_down.top()
+                            - thumb_h_for_mouse_down / 2.)
+                            .clamp(px(0.), travel_for_mouse_down);
+                        let percentage = if travel_for_mouse_down <= px(0.) {
+                            0.
+                        } else {
+                            thumb_top / travel_for_mouse_down
+                        };
+                        offset.y = -(percentage * max_offset_height_for_mouse_down);
+                        *drag_state = Some(ScrollbarDragState {
+                            grab_offset_y: thumb_h_for_mouse_down / 2.,
+                        });
+                        cx.notify(current_view);
+                    }
+
+                    cx.stop_propagation();
+                });
+
+                let scrollbar_drag_state_for_mouse_up = scrollbar_drag_state.clone();
+                let scrollbar_visible_until_for_mouse_up = scrollbar_visible_until.clone();
+                let scrollbar_visibility_seq_for_mouse_up = scrollbar_visibility_seq.clone();
+                let current_view_for_mouse_up = current_view;
+                window.on_mouse_event(move |_: &MouseUpEvent, _phase, window, cx| {
+                    scrollbar_drag_state_for_mouse_up.borrow_mut().take();
+                    if let (Some(visible_until), Some(visibility_seq)) = (
+                        scrollbar_visible_until_for_mouse_up.as_ref(),
+                        scrollbar_visibility_seq_for_mouse_up.as_ref(),
+                    ) {
+                        *visible_until.borrow_mut() = Some(Instant::now() + SCROLLBAR_AUTO_HIDE_DELAY);
+                        let ticket = {
+                            let mut seq = visibility_seq.borrow_mut();
+                            *seq += 1;
+                            *seq
+                        };
+                        let visibility_seq = visibility_seq.clone();
+                        let current_view = current_view_for_mouse_up;
+                        window
+                            .spawn(cx, async move |cx| {
+                                cx.background_executor()
+                                    .timer(
+                                        SCROLLBAR_AUTO_HIDE_DELAY
+                                            .saturating_sub(SCROLLBAR_FADE_OUT_DURATION),
+                                    )
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                                cx.background_executor()
+                                    .timer(SCROLLBAR_FADE_OUT_DURATION)
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                            })
+                            .detach();
+                    }
+                    cx.notify(current_view_for_mouse_up);
+                });
+
+                let scrollbar_drag_state_for_mouse_move = scrollbar_drag_state.clone();
+                let scroll_offset_for_mouse_move = scroll_offset.clone();
+                let scrollbar_visible_until_for_mouse_move = scrollbar_visible_until.clone();
+                let scrollbar_visibility_seq_for_mouse_move = scrollbar_visibility_seq.clone();
+                let current_view = current_view;
+                let track_bounds_for_mouse_move = track_bounds;
+                let travel_for_mouse_move = travel;
+                let max_offset_height_for_mouse_move = max_offset.height;
+                window.on_mouse_event(move |event: &MouseMoveEvent, _phase, window, cx| {
+                    if !event.dragging() {
+                        return;
+                    }
+
+                    let Some(drag_state) = *scrollbar_drag_state_for_mouse_move.borrow() else {
+                        return;
+                    };
+
+                    let thumb_top = (event.position.y
+                        - track_bounds_for_mouse_move.top()
+                        - drag_state.grab_offset_y)
+                        .clamp(px(0.), travel_for_mouse_move);
+                    let percentage = if travel_for_mouse_move <= px(0.) {
+                        0.
+                    } else {
+                        thumb_top / travel_for_mouse_move
+                    };
+                    let mut offset = scroll_offset_for_mouse_move.borrow_mut();
+                    let next_offset_y = -(percentage * max_offset_height_for_mouse_move);
+                    if offset.y != next_offset_y {
+                        offset.y = next_offset_y;
+                        if let (Some(visible_until), Some(visibility_seq)) = (
+                            scrollbar_visible_until_for_mouse_move.as_ref(),
+                            scrollbar_visibility_seq_for_mouse_move.as_ref(),
+                        ) {
+                            *visible_until.borrow_mut() =
+                                Some(Instant::now() + SCROLLBAR_AUTO_HIDE_DELAY);
+                            let ticket = {
+                                let mut seq = visibility_seq.borrow_mut();
+                                *seq += 1;
+                                *seq
+                            };
+                            let visibility_seq = visibility_seq.clone();
+                            let current_view = current_view;
+                            window
+                                .spawn(cx, async move |cx| {
+                                    cx.background_executor()
+                                        .timer(
+                                            SCROLLBAR_AUTO_HIDE_DELAY
+                                                .saturating_sub(SCROLLBAR_FADE_OUT_DURATION),
+                                        )
+                                        .await;
+                                    if *visibility_seq.borrow() == ticket {
+                                        cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                    }
+                                    cx.background_executor()
+                                        .timer(SCROLLBAR_FADE_OUT_DURATION)
+                                        .await;
+                                    if *visibility_seq.borrow() == ticket {
+                                        cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                    }
+                                })
+                                .detach();
+                        }
+                        cx.notify(current_view);
+                    }
+                });
+
+                let hitbox_for_scroll_wheel = hitbox.clone();
+                let scrollbar_visible_until_for_scroll_wheel = scrollbar_visible_until.clone();
+                let scrollbar_visibility_seq_for_scroll_wheel = scrollbar_visibility_seq.clone();
+                let current_view_for_scroll_wheel = current_view;
+                window.on_mouse_event(move |_event: &ScrollWheelEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble
+                        || !hitbox_for_scroll_wheel.should_handle_scroll(window)
+                    {
+                        return;
+                    }
+
+                    if let (Some(visible_until), Some(visibility_seq)) = (
+                        scrollbar_visible_until_for_scroll_wheel.as_ref(),
+                        scrollbar_visibility_seq_for_scroll_wheel.as_ref(),
+                    ) {
+                        *visible_until.borrow_mut() = Some(Instant::now() + SCROLLBAR_AUTO_HIDE_DELAY);
+                        let ticket = {
+                            let mut seq = visibility_seq.borrow_mut();
+                            *seq += 1;
+                            *seq
+                        };
+                        let visibility_seq = visibility_seq.clone();
+                        let current_view = current_view_for_scroll_wheel;
+                        window
+                            .spawn(cx, async move |cx| {
+                                cx.background_executor()
+                                    .timer(
+                                        SCROLLBAR_AUTO_HIDE_DELAY
+                                            .saturating_sub(SCROLLBAR_FADE_OUT_DURATION),
+                                    )
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                                cx.background_executor()
+                                    .timer(SCROLLBAR_FADE_OUT_DURATION)
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                            })
+                            .detach();
+                    }
+                });
+
+                let hitbox_for_hover = hitbox.clone();
+                let scrollbar_visible_until_for_hover = scrollbar_visible_until.clone();
+                let scrollbar_visibility_seq_for_hover = scrollbar_visibility_seq.clone();
+                let current_view_for_hover = current_view;
+                let track_bounds_for_hover = track_bounds;
+                let thumb_bounds_for_hover = thumb_bounds;
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble || !hitbox_for_hover.is_hovered(window) {
+                        return;
+                    }
+
+                    if !track_bounds_for_hover.contains(&event.position)
+                        && !thumb_bounds_for_hover.contains(&event.position)
+                    {
+                        return;
+                    }
+
+                    if let (Some(visible_until), Some(visibility_seq)) = (
+                        scrollbar_visible_until_for_hover.as_ref(),
+                        scrollbar_visibility_seq_for_hover.as_ref(),
+                    ) {
+                        *visible_until.borrow_mut() = Some(Instant::now() + SCROLLBAR_AUTO_HIDE_DELAY);
+                        let ticket = {
+                            let mut seq = visibility_seq.borrow_mut();
+                            *seq += 1;
+                            *seq
+                        };
+                        let visibility_seq = visibility_seq.clone();
+                        let current_view = current_view_for_hover;
+                        window
+                            .spawn(cx, async move |cx| {
+                                cx.background_executor()
+                                    .timer(
+                                        SCROLLBAR_AUTO_HIDE_DELAY
+                                            .saturating_sub(SCROLLBAR_FADE_OUT_DURATION),
+                                    )
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                                cx.background_executor()
+                                    .timer(SCROLLBAR_FADE_OUT_DURATION)
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                            })
+                            .detach();
+                    }
+                });
+            }
+
+            let dragging = scrollbar_drag_state
+                .as_ref()
+                .is_some_and(|state| state.borrow().is_some());
+            let visible_until = scrollbar_visible_until
+                .as_ref()
+                .and_then(|visible_until| *visible_until.borrow());
+            let now = Instant::now();
+            let fade_factor = if cx.should_auto_hide_scrollbars() {
+                if dragging {
+                    1.0
+                } else if let Some(until) = visible_until {
+                    if until <= now {
+                        return;
+                    }
+                    let remaining = until.saturating_duration_since(now);
+                    if remaining <= SCROLLBAR_FADE_OUT_DURATION {
+                        window.refresh();
+                        (remaining.as_secs_f32() / SCROLLBAR_FADE_OUT_DURATION.as_secs_f32())
+                            .clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    }
+                } else {
+                    return;
+                }
+            } else {
+                1.0
+            };
+
+            let mouse_position = window.mouse_position();
+            let track_hovered = track_bounds.contains(&mouse_position);
+            let thumb_hovered = thumb_bounds.contains(&mouse_position);
+
+            let (mut track_color, mut thumb_color) = if dragging {
+                (crate::rgba(0xA1A1AA5C), crate::rgba(0xE4E4E7FF))
+            } else if thumb_hovered {
+                (crate::rgba(0xA1A1AA40), crate::rgba(0xD4D4D8F0))
+            } else if track_hovered {
+                (crate::rgba(0xA1A1AA38), crate::rgba(0xB4B4BBDE))
+            } else {
+                (crate::rgba(0xA1A1AA28), crate::rgba(0xA1A1AAD0))
+            };
+            track_color.a *= fade_factor;
+            thumb_color.a *= fade_factor;
+
+            let radius = scrollbar_width / 2.;
+            window.paint_quad(crate::quad(
+                track_bounds,
+                radius,
+                track_color,
+                px(0.),
+                crate::transparent_black(),
+                crate::BorderStyle::default(),
+            ));
+            window.paint_quad(crate::quad(
+                thumb_bounds,
+                radius,
+                thumb_color,
+                px(0.),
+                crate::transparent_black(),
+                crate::BorderStyle::default(),
+            ));
+        }
+    }
+
     /// Compute the visual style for this element, based on the current bounds and the element's state.
     pub fn compute_style(
         &self,
@@ -2805,7 +3249,15 @@ pub struct InteractiveElementState {
     pub(crate) hover_listener_state: Option<Rc<RefCell<bool>>>,
     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    pub(crate) scrollbar_drag_state: Option<Rc<RefCell<Option<ScrollbarDragState>>>>,
+    pub(crate) scrollbar_visible_until: Option<Rc<RefCell<Option<Instant>>>>,
+    pub(crate) scrollbar_visibility_seq: Option<Rc<RefCell<u64>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ScrollbarDragState {
+    grab_offset_y: Pixels,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
