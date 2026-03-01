@@ -14,7 +14,6 @@ mod pasteboard;
 #[cfg(feature = "screen-capture")]
 mod screen_capture;
 
-mod metal_atlas;
 mod wgpu_renderer;
 
 use wgpu_renderer as renderer;

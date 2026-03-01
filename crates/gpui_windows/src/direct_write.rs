@@ -1102,7 +1102,7 @@ impl DirectWriteState {
             gamma_ratios,
             grayscale_enhanced_contrast,
             ..
-        } = DirectXRenderer::get_font_info();
+        } = crate::directx_renderer::DirectXRenderer::get_font_info();
 
         for layer in glyph_layers {
             let params = GlyphLayerTextureParams {
