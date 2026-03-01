@@ -15,9 +15,9 @@ mod pasteboard;
 mod screen_capture;
 
 mod metal_atlas;
-pub mod metal_renderer;
+mod wgpu_renderer;
 
-use metal_renderer as renderer;
+use wgpu_renderer as renderer;
 
 #[cfg(feature = "font-kit")]
 mod open_type;

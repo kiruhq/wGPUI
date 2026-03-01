@@ -2064,8 +2064,10 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
     let size = lock.content_size();
     let drawable_size = size.to_device_pixels(scale_factor);
     unsafe {
+        let native_view = lock.native_view.as_ptr() as id;
+        let layer: id = msg_send![native_view, layer];
         let _: () = msg_send![
-            lock.renderer.layer(),
+            layer,
             setContentsScale: scale_factor as f64
         ];
     }
@@ -2186,9 +2188,7 @@ extern "C" fn close_window(this: &Object, _: Sel) {
 }
 
 extern "C" fn make_backing_layer(this: &Object, _: Sel) -> id {
-    let window_state = unsafe { get_window_state(this) };
-    let window_state = window_state.as_ref().lock();
-    window_state.renderer.layer_ptr() as id
+    unsafe { msg_send![super(this, class!(NSView)), makeBackingLayer] }
 }
 
 extern "C" fn view_did_change_backing_properties(this: &Object, _: Sel) {
