@@ -102,6 +102,16 @@ pub struct CustomShaderDescriptor<'a> {
     pub instance_count: u32,
     pub uniform_bytes: Option<&'a [u8]>,
     pub blend_state: Option<wgpu::BlendState>,
+    pub texture_mode: CustomShaderTextureMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CustomShaderTextureMode {
+    #[default]
+    None,
+    Texture2d,
+    Texture2dPair,
+    Texture2dPairWith3d,
 }
 
 #[derive(Clone)]
@@ -116,6 +126,7 @@ pub struct GlobalCustomShaderConfig {
     pub uniform_bytes: Option<Vec<u8>>,
     pub blend_state: Option<wgpu::BlendState>,
     pub animate_uniforms_with_time: bool,
+    pub texture_mode: CustomShaderTextureMode,
 }
 
 impl Default for GlobalCustomShaderConfig {
@@ -131,6 +142,7 @@ impl Default for GlobalCustomShaderConfig {
             uniform_bytes: None,
             blend_state: None,
             animate_uniforms_with_time: false,
+            texture_mode: CustomShaderTextureMode::None,
         }
     }
 }
@@ -141,6 +153,13 @@ static GLOBAL_CUSTOM_SHADER_RUNTIME: OnceLock<Mutex<GlobalCustomShaderRuntime>> 
 static NAMED_CUSTOM_SHADER_CONFIGS: OnceLock<Mutex<HashMap<String, GlobalCustomShaderConfig>>> =
     OnceLock::new();
 static SHADER_SURFACE_DRAWS: OnceLock<Mutex<Vec<ShaderSurfaceDraw>>> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES: OnceLock<Mutex<HashMap<String, ShaderSurfaceTextureData>>> =
+    OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES_NV12: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTexturePairData>>,
+> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE3D_UPDATES: OnceLock<Mutex<HashMap<String, ShaderSurfaceTexture3dData>>> =
+    OnceLock::new();
 
 fn global_custom_shader_config() -> &'static Mutex<Option<GlobalCustomShaderConfig>> {
     GLOBAL_CUSTOM_SHADER_CONFIG.get_or_init(|| Mutex::new(None))
@@ -177,10 +196,44 @@ fn shader_surface_draws() -> &'static Mutex<Vec<ShaderSurfaceDraw>> {
     SHADER_SURFACE_DRAWS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn shader_surface_texture_updates() -> &'static Mutex<HashMap<String, ShaderSurfaceTextureData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn shader_surface_texture_updates_pair()
+-> &'static Mutex<HashMap<String, ShaderSurfaceTexturePairData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES_NV12.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn shader_surface_texture_3d_updates() -> &'static Mutex<HashMap<String, ShaderSurfaceTexture3dData>> {
+    SHADER_SURFACE_TEXTURE3D_UPDATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn take_shader_surface_draws() -> Vec<ShaderSurfaceDraw> {
     shader_surface_draws()
         .lock()
         .map(|mut draws| std::mem::take(&mut *draws))
+        .unwrap_or_default()
+}
+
+fn take_shader_surface_texture_updates() -> HashMap<String, ShaderSurfaceTextureData> {
+    shader_surface_texture_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_shader_surface_texture_updates_pair() -> HashMap<String, ShaderSurfaceTexturePairData> {
+    shader_surface_texture_updates_pair()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_shader_surface_texture_3d_updates() -> HashMap<String, ShaderSurfaceTexture3dData> {
+    shader_surface_texture_3d_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
         .unwrap_or_default()
 }
 
@@ -240,11 +293,73 @@ pub struct ShaderSurfaceDraw {
     pub shader_key: String,
     pub normalized_bounds: [f32; 4],
     pub uniform_bytes: Option<Vec<u8>>,
+    pub texture_key: Option<String>,
 }
 
 pub fn push_shader_surface_draw(draw: ShaderSurfaceDraw) {
     if let Ok(mut draws) = shader_surface_draws().lock() {
         draws.push(draw);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShaderSurfaceTextureFormat {
+    Bgra8Unorm,
+    Rgba8Unorm,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShaderSurfaceTextureData {
+    pub key: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+    pub format: ShaderSurfaceTextureFormat,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShaderSurfaceTexturePairData {
+    pub key: String,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShaderSurfaceTexture3dData {
+    pub key: String,
+    pub size: u32,
+    pub data: Vec<u8>,
+}
+
+pub fn upsert_shader_surface_texture(texture: ShaderSurfaceTextureData) {
+    if let Ok(mut updates) = shader_surface_texture_updates().lock() {
+        updates.insert(texture.key.clone(), texture);
+    }
+}
+
+pub fn upsert_shader_surface_texture_pair(texture: ShaderSurfaceTexturePairData) {
+    if let Ok(mut updates) = shader_surface_texture_updates_pair().lock() {
+        updates.insert(texture.key.clone(), texture);
+    }
+}
+
+pub fn upsert_shader_surface_texture_3d(lut: ShaderSurfaceTexture3dData) {
+    if let Ok(mut updates) = shader_surface_texture_3d_updates().lock() {
+        updates.insert(lut.key.clone(), lut);
+    }
+}
+
+pub fn remove_shader_surface_texture(key: &str) {
+    if let Ok(mut updates) = shader_surface_texture_updates().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = shader_surface_texture_updates_pair().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = shader_surface_texture_3d_updates().lock() {
+        updates.remove(key);
     }
 }
 
@@ -260,6 +375,7 @@ impl<'a> Default for CustomShaderDescriptor<'a> {
             instance_count: 1,
             uniform_bytes: None,
             blend_state: None,
+            texture_mode: CustomShaderTextureMode::None,
         }
     }
 }
@@ -267,8 +383,9 @@ impl<'a> Default for CustomShaderDescriptor<'a> {
 pub struct WgpuCustomShader {
     pipeline: wgpu::RenderPipeline,
     uniform_buffer: Option<wgpu::Buffer>,
-    uniform_bind_group: Option<wgpu::BindGroup>,
+    bind_group_layout: Option<wgpu::BindGroupLayout>,
     uniform_size: Option<NonZeroU64>,
+    texture_mode: CustomShaderTextureMode,
     vertex_count: u32,
     instance_count: u32,
 }
@@ -277,6 +394,18 @@ struct NamedCustomShader {
     shader: WgpuCustomShader,
     uniform_template: Option<Vec<u8>>,
     animate_uniforms_with_time: bool,
+}
+
+struct ShaderSurfaceTextureGpu {
+    texture_primary: wgpu::Texture,
+    view_primary: wgpu::TextureView,
+    texture_secondary: Option<wgpu::Texture>,
+    view_secondary: Option<wgpu::TextureView>,
+    mode: CustomShaderTextureMode,
+    width: u32,
+    height: u32,
+    texture_3d: Option<wgpu::Texture>,
+    view_3d: Option<wgpu::TextureView>,
 }
 
 struct WgpuPipelines {
@@ -334,6 +463,9 @@ pub struct WgpuRenderer {
     global_custom_shader_last_tick: Instant,
     global_custom_shader_time_seconds: f32,
     named_custom_shaders: HashMap<String, NamedCustomShader>,
+    shader_surface_textures: HashMap<String, ShaderSurfaceTextureGpu>,
+    custom_shader_fallback_texture_view: wgpu::TextureView,
+    custom_shader_fallback_view_3d: wgpu::TextureView,
 }
 
 impl WgpuRenderer {
@@ -504,6 +636,83 @@ impl WgpuRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let custom_shader_fallback_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("custom_shader_fallback_texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &custom_shader_fallback_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0, 0, 0, 0],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let custom_shader_fallback_texture_view =
+            custom_shader_fallback_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let custom_shader_fallback_3d = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("custom_shader_fallback_3d"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 2,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let identity_lut_data: [u8; 32] = [
+            0, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 255, 255, 0, 255, 0, 0, 255, 255, 255,
+            0, 255, 255, 0, 255, 255, 255, 255, 255, 255, 255,
+        ];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &custom_shader_fallback_3d,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &identity_lut_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(8),
+                rows_per_image: Some(2),
+            },
+            wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 2,
+            },
+        );
+        let custom_shader_fallback_view_3d =
+            custom_shader_fallback_3d.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            });
 
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
@@ -613,6 +822,9 @@ impl WgpuRenderer {
             global_custom_shader_last_tick: Instant::now(),
             global_custom_shader_time_seconds: 0.0,
             named_custom_shaders: HashMap::new(),
+            shader_surface_textures: HashMap::new(),
+            custom_shader_fallback_texture_view,
+            custom_shader_fallback_view_3d,
         })
     }
 
@@ -1233,49 +1445,134 @@ impl WgpuRenderer {
             })
             .transpose()?;
 
-        let (uniform_buffer, uniform_bind_group, uniform_layout) =
-            if let Some(bytes) = descriptor.uniform_bytes {
-                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: descriptor.label,
-                    size: bytes.len() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
+        let uniform_buffer = if let Some(bytes) = descriptor.uniform_bytes {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: descriptor.label,
+                size: bytes.len() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&buffer, 0, bytes);
+            Some(buffer)
+        } else {
+            None
+        };
+
+        let mut bind_group_layout_entries = Vec::new();
+        if uniform_buffer.is_some() {
+            bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: uniform_size,
+                },
+                count: None,
+            });
+        }
+        match descriptor.texture_mode {
+            CustomShaderTextureMode::Texture2d => {
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 });
-                self.queue.write_buffer(&buffer, 0, bytes);
-
-                let layout =
-                    self.device
-                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                            label: descriptor.label,
-                            entries: &[wgpu::BindGroupLayoutEntry {
-                                binding: 0,
-                                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                                ty: wgpu::BindingType::Buffer {
-                                    ty: wgpu::BufferBindingType::Uniform,
-                                    has_dynamic_offset: false,
-                                    min_binding_size: uniform_size,
-                                },
-                                count: None,
-                            }],
-                        });
-
-                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: descriptor.label,
-                    layout: &layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &buffer,
-                            offset: 0,
-                            size: uniform_size,
-                        }),
-                    }],
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
                 });
+            }
+            CustomShaderTextureMode::Texture2dPair => {
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                });
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                });
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                });
+            }
+            CustomShaderTextureMode::Texture2dPairWith3d => {
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                });
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                });
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                });
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                });
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                });
+            }
+            CustomShaderTextureMode::None => {}
+        }
 
-                (Some(buffer), Some(bind_group), Some(layout))
-            } else {
-                (None, None, None)
-            };
+        let bind_group_layout = if bind_group_layout_entries.is_empty() {
+            None
+        } else {
+            Some(self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: descriptor.label,
+                entries: &bind_group_layout_entries,
+            }))
+        };
 
         let default_blend = match self.surface_config.alpha_mode {
             wgpu::CompositeAlphaMode::PreMultiplied => {
@@ -1291,7 +1588,7 @@ impl WgpuRenderer {
         };
 
         let layout_refs: [&wgpu::BindGroupLayout; 1];
-        let bind_group_layouts = if let Some(layout) = uniform_layout.as_ref() {
+        let bind_group_layouts = if let Some(layout) = bind_group_layout.as_ref() {
             layout_refs = [layout];
             &layout_refs[..]
         } else {
@@ -1345,8 +1642,9 @@ impl WgpuRenderer {
         Ok(WgpuCustomShader {
             pipeline,
             uniform_buffer,
-            uniform_bind_group,
+            bind_group_layout,
             uniform_size,
+            texture_mode: descriptor.texture_mode,
             vertex_count: descriptor.vertex_count,
             instance_count: descriptor.instance_count,
         })
@@ -1396,6 +1694,7 @@ impl WgpuRenderer {
             instance_count: config.instance_count,
             uniform_bytes: config.uniform_bytes.as_deref(),
             blend_state: config.blend_state,
+            texture_mode: config.texture_mode,
         };
 
         match self.create_custom_shader(descriptor) {
@@ -1452,6 +1751,7 @@ impl WgpuRenderer {
         custom_shader_time_seconds: f32,
     ) {
         self.atlas.before_frame();
+        self.sync_shader_surface_textures();
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -1642,7 +1942,7 @@ impl WgpuRenderer {
                         depth_stencil_attachment: None,
                         ..Default::default()
                     });
-                    self.draw_custom_shader_pass(shader, &mut pass);
+                    self.draw_custom_shader_pass(shader, &mut pass, None);
                 }
             }
 
@@ -1686,7 +1986,11 @@ impl WgpuRenderer {
                     ..Default::default()
                 });
                 pass.set_scissor_rect(x, y, width, height);
-                self.draw_custom_shader_pass(&named_shader.shader, &mut pass);
+                let texture_entry = draw
+                    .texture_key
+                    .as_ref()
+                    .and_then(|key| self.shader_surface_textures.get(key));
+                self.draw_custom_shader_pass(&named_shader.shader, &mut pass, texture_entry);
             }
 
             if overflow {
@@ -1709,12 +2013,111 @@ impl WgpuRenderer {
         }
     }
 
-    fn draw_custom_shader_pass(&self, shader: &WgpuCustomShader, pass: &mut wgpu::RenderPass<'_>) {
+    fn draw_custom_shader_pass(
+        &self,
+        shader: &WgpuCustomShader,
+        pass: &mut wgpu::RenderPass<'_>,
+        texture_entry: Option<&ShaderSurfaceTextureGpu>,
+    ) {
         pass.set_pipeline(&shader.pipeline);
-        if let Some(bind_group) = shader.uniform_bind_group.as_ref() {
-            pass.set_bind_group(0, bind_group, &[]);
+        if let Some(bind_group) = self.create_custom_shader_bind_group(shader, texture_entry) {
+            pass.set_bind_group(0, &bind_group, &[]);
         }
         pass.draw(0..shader.vertex_count, 0..shader.instance_count);
+    }
+
+    fn create_custom_shader_bind_group(
+        &self,
+        shader: &WgpuCustomShader,
+        texture_entry: Option<&ShaderSurfaceTextureGpu>,
+    ) -> Option<wgpu::BindGroup> {
+        let layout = shader.bind_group_layout.as_ref()?;
+        let mut entries = Vec::new();
+
+        if let (Some(buffer), Some(size)) = (shader.uniform_buffer.as_ref(), shader.uniform_size) {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset: 0,
+                    size: Some(size),
+                }),
+            });
+        }
+
+        match shader.texture_mode {
+            CustomShaderTextureMode::Texture2d => {
+                let view = texture_entry
+                    .map(|entry| &entry.view_primary)
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+            }
+            CustomShaderTextureMode::Texture2dPair => {
+                let view_y = texture_entry
+                    .map(|entry| &entry.view_primary)
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let view_uv = texture_entry
+                    .and_then(|entry| entry.view_secondary.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(view_y),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(view_uv),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+            }
+            CustomShaderTextureMode::Texture2dPairWith3d => {
+                let view_y = texture_entry
+                    .map(|entry| &entry.view_primary)
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let view_uv = texture_entry
+                    .and_then(|entry| entry.view_secondary.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let lut_view = texture_entry
+                    .and_then(|entry| entry.view_3d.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_view_3d);
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(view_y),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(view_uv),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(lut_view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+            }
+            CustomShaderTextureMode::None => {}
+        }
+
+        Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("custom_shader_bind_group"),
+            layout,
+            entries: &entries,
+        }))
     }
 
     fn ensure_named_custom_shaders(&mut self, draws: &[ShaderSurfaceDraw]) {
@@ -1745,6 +2148,7 @@ impl WgpuRenderer {
                 instance_count: config.instance_count,
                 uniform_bytes: config.uniform_bytes.as_deref(),
                 blend_state: config.blend_state,
+                texture_mode: config.texture_mode,
             };
 
             match self.create_custom_shader(descriptor) {
@@ -1818,6 +2222,281 @@ impl WgpuRenderer {
         }
 
         self.update_custom_shader_uniforms(&named_shader.shader, &bytes)
+    }
+
+    fn sync_shader_surface_textures(&mut self) {
+        let updates_rgba = take_shader_surface_texture_updates();
+        let updates_pair = take_shader_surface_texture_updates_pair();
+        let updates_3d = take_shader_surface_texture_3d_updates();
+
+        for (key, update) in updates_rgba {
+            if update.width == 0 || update.height == 0 {
+                continue;
+            }
+
+            let expected_len = update.width as usize * update.height as usize * 4;
+            if update.bytes.len() < expected_len {
+                continue;
+            }
+
+            let needs_recreate = self
+                .shader_surface_textures
+                .get(&key)
+                .map(|existing| {
+                    existing.width != update.width
+                        || existing.height != update.height
+                        || existing.mode != CustomShaderTextureMode::Texture2d
+                })
+                .unwrap_or(true);
+
+            if needs_recreate {
+                let texture_primary = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("shader_surface_texture"),
+                    size: wgpu::Extent3d {
+                        width: update.width,
+                        height: update.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: Self::shader_surface_texture_format(update.format),
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view_primary =
+                    texture_primary.create_view(&wgpu::TextureViewDescriptor::default());
+                self.shader_surface_textures.insert(
+                    key.clone(),
+                    ShaderSurfaceTextureGpu {
+                        texture_primary,
+                        view_primary,
+                        texture_secondary: None,
+                        view_secondary: None,
+                        mode: CustomShaderTextureMode::Texture2d,
+                        width: update.width,
+                        height: update.height,
+                        texture_3d: None,
+                        view_3d: None,
+                    },
+                );
+            }
+
+            let Some(entry) = self.shader_surface_textures.get(&key) else {
+                continue;
+            };
+
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &entry.texture_primary,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &update.bytes[..expected_len],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(update.width * 4),
+                    rows_per_image: Some(update.height),
+                },
+                wgpu::Extent3d {
+                    width: update.width,
+                    height: update.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        for (key, update) in updates_pair {
+            if update.width == 0 || update.height == 0 || update.stride == 0 {
+                continue;
+            }
+
+            let y_plane_size = (update.stride * update.height) as usize;
+            let uv_plane_size = (update.stride * (update.height / 2)) as usize;
+            let total_size = y_plane_size + uv_plane_size;
+            if update.data.len() < total_size {
+                continue;
+            }
+
+            let needs_recreate = self
+                .shader_surface_textures
+                .get(&key)
+                .map(|existing| {
+                    existing.width != update.width
+                        || existing.height != update.height
+                        || (existing.mode != CustomShaderTextureMode::Texture2dPair
+                            && existing.mode != CustomShaderTextureMode::Texture2dPairWith3d)
+                })
+                .unwrap_or(true);
+
+            if needs_recreate {
+                let texture_primary = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("shader_surface_texture_nv12_y"),
+                    size: wgpu::Extent3d {
+                        width: update.width,
+                        height: update.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view_primary =
+                    texture_primary.create_view(&wgpu::TextureViewDescriptor::default());
+
+                let texture_secondary = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("shader_surface_texture_nv12_uv"),
+                    size: wgpu::Extent3d {
+                        width: update.width / 2,
+                        height: update.height / 2,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rg8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view_secondary =
+                    texture_secondary.create_view(&wgpu::TextureViewDescriptor::default());
+
+                self.shader_surface_textures.insert(
+                    key.clone(),
+                    ShaderSurfaceTextureGpu {
+                        texture_primary,
+                        view_primary,
+                        texture_secondary: Some(texture_secondary),
+                        view_secondary: Some(view_secondary),
+                        mode: CustomShaderTextureMode::Texture2dPairWith3d,
+                        width: update.width,
+                        height: update.height,
+                        texture_3d: None,
+                        view_3d: None,
+                    },
+                );
+            }
+
+            let Some(entry) = self.shader_surface_textures.get(&key) else {
+                continue;
+            };
+            let Some(texture_uv) = entry.texture_secondary.as_ref() else {
+                continue;
+            };
+
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &entry.texture_primary,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &update.data[..y_plane_size],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(update.stride),
+                    rows_per_image: Some(update.height),
+                },
+                wgpu::Extent3d {
+                    width: update.width,
+                    height: update.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: texture_uv,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &update.data[y_plane_size..total_size],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(update.stride),
+                    rows_per_image: Some(update.height / 2),
+                },
+                wgpu::Extent3d {
+                    width: update.width / 2,
+                    height: update.height / 2,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        for (key, lut) in updates_3d {
+            if lut.size == 0 {
+                continue;
+            }
+            let Some(entry) = self.shader_surface_textures.get_mut(&key) else {
+                continue;
+            };
+
+            let expected_len = (lut.size as usize)
+                .saturating_mul(lut.size as usize)
+                .saturating_mul(lut.size as usize)
+                .saturating_mul(4);
+            if lut.data.len() < expected_len {
+                continue;
+            }
+
+            let lut_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("shader_surface_texture3d"),
+                size: wgpu::Extent3d {
+                    width: lut.size,
+                    height: lut.size,
+                    depth_or_array_layers: lut.size,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let lut_view = lut_texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            });
+
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &lut_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &lut.data[..expected_len],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(lut.size * 4),
+                    rows_per_image: Some(lut.size),
+                },
+                wgpu::Extent3d {
+                    width: lut.size,
+                    height: lut.size,
+                    depth_or_array_layers: lut.size,
+                },
+            );
+
+            entry.texture_3d = Some(lut_texture);
+            entry.view_3d = Some(lut_view);
+            if entry.mode == CustomShaderTextureMode::Texture2dPair {
+                entry.mode = CustomShaderTextureMode::Texture2dPairWith3d;
+            }
+        }
+    }
+
+    fn shader_surface_texture_format(format: ShaderSurfaceTextureFormat) -> wgpu::TextureFormat {
+        match format {
+            ShaderSurfaceTextureFormat::Bgra8Unorm => wgpu::TextureFormat::Bgra8Unorm,
+            ShaderSurfaceTextureFormat::Rgba8Unorm => wgpu::TextureFormat::Rgba8Unorm,
+        }
     }
 
     fn normalized_bounds_to_scissor(

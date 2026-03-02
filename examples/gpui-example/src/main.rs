@@ -310,6 +310,7 @@ fn cube_shader_surface(enabled: bool) -> impl IntoElement {
             shader_key: SPINNING_CUBE_SHADER_KEY.to_string(),
             normalized_bounds: [min_x, min_y, max_x, max_y],
             uniform_bytes: Some(uniform_bytes),
+            texture_key: None,
         });
     })
     .size_full()
