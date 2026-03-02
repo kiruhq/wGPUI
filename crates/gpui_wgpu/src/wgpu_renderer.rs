@@ -886,6 +886,7 @@ pub struct WgpuRenderer {
     shader_surface_textures: HashMap<String, ShaderSurfaceTextureGpu>,
     custom_shader_fallback_texture_view: wgpu::TextureView,
     custom_shader_fallback_view_3d: wgpu::TextureView,
+    cached_shader_surface_draws: Vec<ShaderSurfaceDraw>,
 }
 
 impl WgpuRenderer {
@@ -1246,6 +1247,7 @@ impl WgpuRenderer {
             shader_surface_textures: HashMap::new(),
             custom_shader_fallback_texture_view,
             custom_shader_fallback_view_3d,
+            cached_shader_surface_draws: Vec::new(),
         })
     }
 
@@ -1806,7 +1808,13 @@ impl WgpuRenderer {
 
     pub fn draw(&mut self, scene: &Scene) {
         self.ensure_global_custom_shader();
-        let shader_surface_draws = take_render_primitive_draws();
+        let new_draws = take_render_primitive_draws();
+        let shader_surface_draws = if !new_draws.is_empty() {
+            self.cached_shader_surface_draws = new_draws.clone();
+            new_draws
+        } else {
+            self.cached_shader_surface_draws.clone()
+        };
         self.ensure_named_custom_shaders(&shader_surface_draws);
         let runtime = global_custom_shader_runtime()
             .lock()
