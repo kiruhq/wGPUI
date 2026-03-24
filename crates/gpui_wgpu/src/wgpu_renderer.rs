@@ -152,6 +152,7 @@ static GLOBAL_CUSTOM_SHADER_RUNTIME: OnceLock<Mutex<GlobalCustomShaderRuntime>> 
 static NAMED_CUSTOM_SHADER_CONFIGS: OnceLock<Mutex<HashMap<String, GlobalCustomShaderConfig>>> =
     OnceLock::new();
 static SHADER_SURFACE_DRAWS: OnceLock<Mutex<Vec<ShaderSurfaceDraw>>> = OnceLock::new();
+static LAST_SHADER_SURFACE_DRAWS: OnceLock<Mutex<Vec<ShaderSurfaceDraw>>> = OnceLock::new();
 static SHADER_SURFACE_TEXTURE_UPDATES: OnceLock<Mutex<HashMap<String, ShaderSurfaceTextureData>>> =
     OnceLock::new();
 static SHADER_SURFACE_TEXTURE_UPDATES_NV12: OnceLock<
@@ -278,11 +279,31 @@ fn set_primitive_render_context(
     }
 }
 
+fn last_render_primitive_draws() -> &'static Mutex<Vec<ShaderSurfaceDraw>> {
+    LAST_SHADER_SURFACE_DRAWS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn take_render_primitive_draws() -> Vec<ShaderSurfaceDraw> {
-    render_primitive_draws()
+    let draws = render_primitive_draws()
         .lock()
         .map(|mut draws| std::mem::take(&mut *draws))
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    if draws.is_empty() {
+        // No new draws were queued (present-only frame without a draw pass).
+        // Reuse the previous frame's draws to avoid a black flash.
+        return last_render_primitive_draws()
+            .lock()
+            .map(|last| last.clone())
+            .unwrap_or_default();
+    }
+
+    // Stash a copy for potential reuse on the next present-only frame.
+    if let Ok(mut last) = last_render_primitive_draws().lock() {
+        *last = draws.clone();
+    }
+
+    draws
 }
 
 fn take_render_primitive_texture_updates() -> HashMap<String, ShaderSurfaceTextureData> {
