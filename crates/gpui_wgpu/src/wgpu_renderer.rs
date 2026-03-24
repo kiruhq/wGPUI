@@ -765,6 +765,16 @@ pub fn submit_render_primitive(primitive: RenderPrimitive) {
     }
 }
 
+/// Clear the cached last-frame draws so that no shader surface is rendered
+/// on the next frame. Without this, the renderer reuses the previous frame's
+/// draws on present-only frames, which causes stale video surfaces to persist
+/// after navigating away from a page that uses shader surfaces.
+pub fn clear_last_render_primitive_draws() {
+    if let Ok(mut last) = last_render_primitive_draws().lock() {
+        last.clear();
+    }
+}
+
 pub fn remove_render_primitive_texture(key: &str) {
     if let Ok(mut updates) = render_primitive_texture_updates().lock() {
         updates.remove(key);
