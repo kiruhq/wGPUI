@@ -70,6 +70,17 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Prevents a single-axis scroll container from using wheel deltas from the
+    /// other axis as a fallback.
+    ///
+    /// This is opt-in. By default, a horizontal-only container may consume
+    /// vertical wheel deltas, and a vertical-only container may consume
+    /// horizontal wheel deltas.
+    fn restrict_scroll_to_axis(mut self) -> Self {
+        self.style().restrict_scroll_to_axis = Some(true);
+        self
+    }
+
     /// Sets the whitespace of the element to `normal`.
     /// [Docs](https://tailwindcss.com/docs/whitespace#normal)
     fn whitespace_normal(mut self) -> Self {
@@ -864,5 +875,31 @@ pub trait Styled: Sized {
     fn debug_below(mut self) -> Self {
         self.style().debug_below = Some(true);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestElement {
+        style: StyleRefinement,
+    }
+
+    impl Styled for TestElement {
+        fn style(&mut self) -> &mut StyleRefinement {
+            &mut self.style
+        }
+    }
+
+    #[test]
+    fn scroll_axis_restriction_is_opt_in() {
+        let element = TestElement {
+            style: StyleRefinement::default(),
+        };
+        assert_eq!(element.style.restrict_scroll_to_axis, None);
+
+        let element = element.restrict_scroll_to_axis();
+        assert_eq!(element.style.restrict_scroll_to_axis, Some(true));
     }
 }
